@@ -49,12 +49,11 @@ def load_prompts(model: str) -> list[str]:
     task_dict = get_task_dict("longbench_lcc_e", task_manager)
 
     prompts = []
-    for task in task_dict.items():
-        for doc in task.test_docs():
-            docs = list(task.test_docs())
-            for doc in docs:
-                prompt = task.doc_to_text(doc)
-                prompts.append(prompt)
+    for task_name, task in task_dict.items():
+        docs = list(task.test_docs())
+        for doc in docs:
+            prompt = task.doc_to_text(doc)
+            prompts.append(prompt)
 
     print(f"Loaded {len(prompts)} prompts from {list(task_dict.keys())}")
     return prompts
