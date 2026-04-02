@@ -146,6 +146,9 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         )
 
         layer._prob_scale.copy_(prob_scale)
+        layer._prob_scale_float = (
+            prob_scale.item() if isinstance(prob_scale, torch.Tensor) else prob_scale
+        )
         if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
             logger.warning_once(
                 f"Using uncalibrated q_scale {q_scale} and/or prob_scale "

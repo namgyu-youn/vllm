@@ -29,7 +29,7 @@ class KVCacheQuantSchema(BaseModel):
         valid_dtypes = ("float8_e4m3fn", "float8_e4m3fnuz")
         assert self.dtype in valid_dtypes, (
             "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than one of { }!"
+            f"{self.dtype} rather than one of {valid_dtypes}!"
         )
         return self
 
