@@ -90,15 +90,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                     "Only support per-tensor scaling factor for fp8 KV cache"
                 )
 
-            if layer.q_scale < 0.0:
-                logger.warning_once(
-                    "Checkpoint does not provide a q scaling factor. "
-                    "Setting it to k_scale. This only matters for "
-                    "FP8 Attention backends (flash-attn or flashinfer)."
-                )
-                layer._q_scale.copy_(k_scale)
-                layer._q_scale_float = k_scale
-
             # These are used in the final Attention.forward()
             layer._k_scale.copy_(k_scale)
             layer._v_scale.copy_(v_scale)
@@ -116,6 +107,18 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if current_platform.is_fp8_fnuz():
                 q_scale *= 2
             layer.calculate_kv_scales = False
+        elif (
+            is_quantized_kv_cache(layer.kv_cache_dtype)
+            and not layer.calculate_kv_scales
+        ):
+            # No q_scale in checkpoint; fall back to k_scale (already
+            # resolved and FNUZ-adjusted above).
+            logger.warning_once(
+                "Checkpoint does not provide a q scaling factor. "
+                "Setting it to k_scale. This only matters for "
+                "FP8 Attention backends (flash-attn or flashinfer)."
+            )
+            q_scale = layer._k_scale_float
         else:
             q_scale = 1.0
         if layer.prob_scale > 0.0:
@@ -133,7 +136,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         )
         if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
             raise ValueError(
-                "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
+                "Only support per-tensor scaling factor for fp8-quantized Q/prob"
             )
 
         # These are used in the final Attention.forward()

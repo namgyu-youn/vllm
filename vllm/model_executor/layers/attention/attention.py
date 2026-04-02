@@ -130,10 +130,6 @@ def _init_kv_cache_quant(
         quant_config: Optional quantization configuration.
         prefix: Layer name prefix for quantization method lookup.
     """
-    quant_method = (
-        quant_config.get_quant_method(layer, prefix=prefix) if quant_config else None
-    )
-
     # Note [Register q/k/v/prob scales in state dict]
     # When calling model.to(device), only parameters/buffers in state dict are
     # moved. If not registering q/k/v/prob scales in state dict, there would
@@ -228,6 +224,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # llm-compressor mdls need to set cache_dtype to "fp8" manually.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
         if kv_cache_scheme is not None:
+            if cache_config is not None and cache_config.cache_dtype != "fp8":
+                logger.warning(
+                    "kv_cache_scheme is set in the quantization config. "
+                    "Overriding cache_dtype from '%s' to 'fp8'.",
+                    cache_config.cache_dtype,
+                )
             kv_cache_dtype = "fp8"
             calculate_kv_scales = False
             if cache_config is not None:
