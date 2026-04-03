@@ -111,15 +111,17 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                     "scaling factors are properly set in the checkpoint."
                 )
 
-        # --- q_scale: three-priority resolution ---
-        # 1. Checkpoint value wins.
-        # 2. Fall back to k_scale when KV cache is fp8-quantized (k_scale is
-        #    already resolved and FNUZ-adjusted above).
-        # 3. Default to 1.0 otherwise.
-        if layer.q_scale > 0.0:
-            q_scale = layer.q_scale
-            if current_platform.is_fp8_fnuz():
-                q_scale *= 2
+        def _from_checkpoint(param: torch.nn.Parameter) -> float | None:
+            """Return the FNUZ-adjusted float scale, or None if absent."""
+            val = param.item()
+            if val > 0.0:
+                return val * (2 if current_platform.is_fp8_fnuz() else 1)
+            return None
+
+        # --- q_scale: checkpoint → k_scale fallback (fp8 only) → 1.0 ---
+        q = _from_checkpoint(layer.q_scale)
+        if q is not None:
+            q_scale = q
             layer.calculate_kv_scales = False
         elif use_static_kv_scales:
             logger.warning_once(
@@ -130,36 +132,14 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             q_scale = k_scale
         else:
             q_scale = 1.0
-        if layer.prob_scale > 0.0:
-            prob_scale = layer.prob_scale
-            if current_platform.is_fp8_fnuz():
-                prob_scale *= 2
-        else:
-            prob_scale = 1.0
 
-        is_singleton_float = (
-            lambda x: isinstance(x, float)
-            or isinstance(x, torch.Tensor)
-            and x.numel() == 1
-            and x.is_floating_point()
-        )
-        if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
-            raise ValueError(
-                "Only support per-tensor scaling factor for fp8-quantized Q/prob"
-            )
+        # --- prob_scale: checkpoint → 1.0 ---
+        prob_scale = _from_checkpoint(layer.prob_scale) or 1.0
 
-        # These are used in the final Attention.forward()
         layer._q_scale.copy_(q_scale)
-        layer._q_scale_float = (
-            q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
-        )
-
+        layer._q_scale_float = q_scale
         layer._prob_scale.copy_(prob_scale)
-        layer._prob_scale_float = (
-            prob_scale.item()
-            if isinstance(prob_scale, torch.Tensor)
-            else float(prob_scale)
-        )
+        layer._prob_scale_float = prob_scale
         if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
             logger.warning_once(
                 f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
@@ -168,7 +148,4 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                 "available in the fp8 checkpoint."
             )
 
-        del layer.k_scale
-        del layer.v_scale
-        del layer.q_scale
-        del layer.prob_scale
+        del layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
