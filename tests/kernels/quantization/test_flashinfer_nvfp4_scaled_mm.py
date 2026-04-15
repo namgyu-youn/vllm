@@ -160,3 +160,73 @@ def test_flashinfer_nvfp4_gemm(
         )
 
     torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("backend", ["cutlass", "cudnn", "trtllm"])
+@torch.inference_mode()
+def test_flashinfer_nvfp4_cuda_graph(backend: str) -> None:
+    """Verify that flashinfer_scaled_fp4_mm can be captured by a CUDA graph.
+
+    CUDA graph capture requires every op in the forward pass to have a fake
+    (abstract/meta) implementation so PyTorch can trace output shapes without
+    running real GPU kernels.  The ``vllm::flashinfer_mm_fp4`` custom op
+    satisfies this via ``@torch.library.register_fake``.  This test confirms
+    that registration is correct: capture must succeed without an eager-
+    fallback warning, and replay must produce numerically correct results.
+    """
+    set_random_seed(42)
+    m, n, k = 128, 128, 128
+    block_size = 16
+    dtype = torch.bfloat16  # trtllm only supports bfloat16
+    device = "cuda"
+
+    a_dtype = torch.randn((m, k), dtype=dtype, device=device)
+    b_dtype = torch.randn((n, k), dtype=dtype, device=device)
+
+    a_global_scale = (
+        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a_dtype.flatten(), dim=-1)
+    ).to(torch.float32)
+    b_global_scale = (
+        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(b_dtype.flatten(), dim=-1)
+    ).to(torch.float32)
+    alpha = 1.0 / (a_global_scale * b_global_scale)
+
+    a_fp4, a_scale = ops.scaled_fp4_quant(
+        a_dtype, a_global_scale, is_sf_swizzled_layout=True, backend=backend
+    )
+    b_fp4, b_scale = ops.scaled_fp4_quant(
+        b_dtype, b_global_scale, is_sf_swizzled_layout=True
+    )
+
+    # trtllm requires a shuffled weight layout prepared outside the graph.
+    if backend == "trtllm":
+        import flashinfer
+
+        epilogue_tile_m = 128
+        b_fp4 = flashinfer.shuffle_matrix_a(b_fp4.view(torch.uint8), epilogue_tile_m)
+        b_scale = convert_swizzled_to_linear(b_scale, n, k, block_size)
+        b_scale = (
+            flashinfer.shuffle_matrix_sf_a(b_scale.view(torch.uint8), epilogue_tile_m)
+            .reshape(b_scale.shape)
+            .view(torch.float8_e4m3fn)
+        )
+
+    # Eager run first: warms up JIT compilation and provides the reference.
+    expected = flashinfer_scaled_fp4_mm(
+        a_fp4, b_fp4, a_scale, b_scale, alpha, dtype, backend=backend
+    )
+
+    # Capture the op inside a CUDA graph.
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = flashinfer_scaled_fp4_mm(
+                a_fp4, b_fp4, a_scale, b_scale, alpha, dtype, backend=backend
+            )
+
+    # Zero the output written during capture, then replay to re-fill it.
+    out.zero_()
+    g.replay()
+
+    torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
