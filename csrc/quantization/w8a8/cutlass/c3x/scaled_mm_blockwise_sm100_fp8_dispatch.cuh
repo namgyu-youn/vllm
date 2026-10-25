@@ -22,6 +22,68 @@ namespace vllm {
 
 using namespace cute;
 
+// Swap-AB mainloop for PDL launches: A holds the weights, which never depend on
+// the previous kernel, so the first pipeline stages of A are loaded before
+// waiting on it. Activations (B) and scales are loaded after the wait.
+// CUTLASS's own waits compile to no-ops because vLLM does not define
+// CUTLASS_ENABLE_GDC_FOR_SM100.
+template <class Base>
+struct WeightPrefetchMainloop : Base {
+  using Base::Base;
+  bool ab_waited = false;
+  bool sf_waited = false;
+
+  template <class LoadABParams, class TileCoordMNKL, class KTileIterator>
+  CUTLASS_DEVICE auto load_ab(typename Base::MainloopABPipeline pipeline,
+                              typename Base::MainloopABPipelineState state,
+                              LoadABParams const& load_inputs,
+                              TileCoordMNKL const& cta_coord_mnkl,
+                              KTileIterator k_tile_iter, int k_tile_count) {
+    if (ab_waited) {
+      return Base::load_ab(pipeline, state, load_inputs, cta_coord_mnkl,
+                           k_tile_iter, k_tile_count);
+    }
+    // The kernel's first call covers at most `Stages` k-tiles, so every stage
+    // is free and producer_acquire does not wait on the consumer.
+    auto [unused_k_tiles, tAgA_mkl, tBgB_nkl, tAsA, tBsB, mcast_mask_a,
+          mcast_mask_b] = load_inputs;
+    Tensor tAgA = tAgA_mkl(
+        _, get<0>(cta_coord_mnkl) / size(typename Base::TiledMma::AtomThrID{}),
+        _, get<3>(cta_coord_mnkl));
+    Tensor tBgB =
+        tBgB_nkl(_, get<1>(cta_coord_mnkl), _, get<3>(cta_coord_mnkl));
+    auto a_state = state;
+    auto a_iter = k_tile_iter;
+    for (int i = 0; i < k_tile_count; ++i, ++a_state, ++a_iter) {
+      pipeline.producer_acquire(a_state);
+      auto* barrier = pipeline.producer_get_barrier(a_state);
+      if (cute::elect_one_sync()) {
+        copy(this->observed_tma_load_a_->with(*barrier, mcast_mask_a),
+             tAgA(_, *a_iter), tAsA(_, a_state.index()));
+      }
+    }
+    cudaGridDependencySynchronize();
+    ab_waited = true;
+    for (int i = 0; i < k_tile_count; ++i, ++state, ++k_tile_iter) {
+      auto* barrier = pipeline.producer_get_barrier(state);
+      if (cute::elect_one_sync()) {
+        copy(this->observed_tma_load_b_->with(*barrier, mcast_mask_b),
+             tBgB(_, *k_tile_iter), tBsB(_, state.index()));
+      }
+    }
+    return cute::make_tuple(state, k_tile_iter);
+  }
+
+  template <class... Args>
+  CUTLASS_DEVICE auto load_sf(Args&&... args) {
+    if (!sf_waited) {
+      cudaGridDependencySynchronize();
+      sf_waited = true;
+    }
+    return Base::load_sf(std::forward<Args>(args)...);
+  }
+};
+
 // clang-format off
 template <class OutType, int ScaleGranularityM,
           int ScaleGranularityN, int ScaleGranularityK,
@@ -93,7 +155,7 @@ struct cutlass_3x_gemm_fp8_blockwise {
   >::CollectiveOp;
  
   using StageCountType = cutlass::gemm::collective::StageCountAuto; 
-  using CollectiveMainloop = conditional_t<swap_ab,
+  using BuiltMainloop = conditional_t<swap_ab,
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           OperatorClass,
@@ -124,6 +186,8 @@ struct cutlass_3x_gemm_fp8_blockwise {
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
           MainloopScheduler
       >::CollectiveOp>;
+  using CollectiveMainloop = conditional_t<swap_ab,
+      WeightPrefetchMainloop<BuiltMainloop>, BuiltMainloop>;
 
   using KernelType = enable_sm100_to_sm120<cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
@@ -220,8 +284,9 @@ void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Te
   auto c_ptr = static_cast<ElementD*>(out.data_ptr());
   typename GemmKernel::EpilogueArguments epilogue_args{
       {}, c_ptr, c_stride, c_ptr, c_stride};
+  // Only the swap-AB mainloop waits on the previous kernel itself.
   c3x::cutlass_gemm_caller<GemmKernel>(a.device(), prob_shape, mainloop_args,
-                                       epilogue_args);
+                                       epilogue_args, {}, swap_ab);
 }
 
 template <typename OutType>

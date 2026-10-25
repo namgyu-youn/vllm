@@ -25,6 +25,12 @@ __global__ void silu_and_mul_per_block_quant_kernel(
   static_assert((group_size & (group_size - 1)) == 0,
                 "group_size must be a power of 2 for correct reduction");
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Let a PDL-launched consumer (the down-proj GEMM) start loading its
+  // weights now; it still waits for this kernel before reading the outputs.
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
   // Grid: (num_tokens, num_groups)
   int64_t const token_idx = blockIdx.x;
   int const group_idx = blockIdx.y;

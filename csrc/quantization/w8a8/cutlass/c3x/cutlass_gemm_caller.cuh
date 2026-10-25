@@ -36,7 +36,8 @@ void cutlass_gemm_caller(
     torch::stable::Device device, cute::Shape<int, int, int, int> prob_shape,
     typename GemmKernel::MainloopArguments mainloop_args,
     typename GemmKernel::EpilogueArguments epilogue_args,
-    typename GemmKernel::TileSchedulerArguments scheduler = {}) {
+    typename GemmKernel::TileSchedulerArguments scheduler = {},
+    bool launch_with_pdl = false) {
   const torch::stable::accelerator::DeviceGuard device_guard(device.index());
   cutlass::KernelHardwareInfo hw_info;
   typename GemmKernel::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
@@ -58,7 +59,8 @@ void cutlass_gemm_caller(
 
   auto stream = get_current_cuda_stream(device.index());
 
-  cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
+  cutlass::Status status =
+      gemm_op.run(args, workspace.data_ptr(), stream, nullptr, launch_with_pdl);
   CUTLASS_CHECK(status);
 }
 

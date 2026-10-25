@@ -212,12 +212,12 @@ __global__ void per_token_group_quant_8bit_register_kernel(
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    // Trigger before the work so a PDL consumer (e.g. a block-FP8 GEMM) can
+    // prefetch its weights; it still waits for this grid before reading.
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     if (group_id >= num_groups) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-      cudaTriggerProgrammaticLaunchCompletion();
-#endif
       return;
     }
 
@@ -296,10 +296,6 @@ __global__ void per_token_group_quant_8bit_register_kernel(
                               group_id * GROUP_SIZE + lane_id * VEC_SIZE;
     *reinterpret_cast<uint4*>(group_output) =
         make_uint4(packed[0], packed[1], packed[2], packed[3]);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
   }
 }
 
